@@ -221,6 +221,26 @@ impl Server {
         })
     }
 
+    /// Sends `method path` with `body` and the given `Content-Type`, optionally with chunked
+    /// transfer encoding instead of a `Content-Length`.
+    pub fn request_with(&self, method: &str, path: &str, content_type: &str, body: &[u8], chunked: bool) -> Response {
+        let method = reqwest::Method::from_bytes(method.as_bytes()).expect("bad method");
+        let req = self.client.request(method, self.url(path)).header("Content-Type", content_type);
+        let req = if chunked {
+            req.body(reqwest::blocking::Body::new(std::io::Cursor::new(body.to_vec())))
+        } else {
+            req.body(body.to_vec())
+        };
+        let res = req.send().unwrap_or_else(|e| panic!("request to {path} failed: {e}"));
+        let status = res.status().as_u16();
+        let content_type = res
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+        let body = res.bytes().expect("failed to read response body").to_vec();
+        Response { status, content_type, body }
+    }
+
     /// Sends `method path` with a raw text body (which need not be valid JSON).
     pub fn request_raw(&self, method: &str, path: &str, body: &str) -> Response {
         self.request_bytes(method, path, Some(body.as_bytes().to_vec()))
