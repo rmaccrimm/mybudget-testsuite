@@ -275,3 +275,208 @@ impl Server {
         plan["id"].as_str().expect("plan id is not a string").to_owned()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Helpers for the things inside a plan (sections 5 onward).
+
+/// The date the helpers give a non-zero starting balance.
+pub const START_DATE: &str = "2026-10-01";
+
+impl Server {
+    /// Sends `HEAD path`.
+    pub fn head(&self, path: &str) -> Response {
+        self.request_bytes("HEAD", path, None)
+    }
+
+    /// `POST path body`, asserting `201`; returns the created object.
+    pub fn create(&self, path: &str, body: &Value) -> Value {
+        let res = self.post(path, body);
+        assert_eq!(res.status, 201, "POST {path} {body}: {}", res.text());
+        res.json()
+    }
+
+    /// `GET path`, asserting `200`; returns the body.
+    pub fn get_json(&self, path: &str) -> Value {
+        let res = self.get(path);
+        assert_eq!(res.status, 200, "GET {path}: {}", res.text());
+        res.json()
+    }
+
+    /// `PATCH path body`, asserting `200`; returns the body.
+    pub fn patch_ok(&self, path: &str, body: &Value) -> Value {
+        let res = self.patch(path, body);
+        assert_eq!(res.status, 200, "PATCH {path} {body}: {}", res.text());
+        res.json()
+    }
+
+    /// `GET path`, asserting `200` and a JSON array; returns its items.
+    pub fn list(&self, path: &str) -> Vec<Value> {
+        let body = self.get_json(path);
+        body.as_array().unwrap_or_else(|| panic!("GET {path} did not return an array: {body}")).clone()
+    }
+
+    /// Creates an account in `plan` from `body`, asserting success.
+    pub fn create_account(&self, plan: &str, body: &Value) -> Value {
+        self.create(&format!("/plans/{plan}/accounts"), body)
+    }
+
+    /// Creates an account named `name` of type `ty`; a non-zero `starting_balance` is dated
+    /// `START_DATE`.
+    pub fn add_account(&self, plan: &str, name: &str, ty: &str, starting_balance: i64) -> Value {
+        let body = if starting_balance == 0 {
+            json!({"name": name, "type": ty})
+        } else {
+            json!({"name": name, "type": ty, "starting_balance": starting_balance, "starting_date": START_DATE})
+        };
+        self.create_account(plan, &body)
+    }
+
+    /// Creates a payee named `name` in `plan`, asserting success.
+    pub fn create_payee(&self, plan: &str, name: &str) -> Value {
+        self.create(&format!("/plans/{plan}/payees"), &json!({ "name": name }))
+    }
+
+    /// Creates a category group named `name` in `plan`, asserting success.
+    pub fn create_group(&self, plan: &str, name: &str) -> Value {
+        self.create(&format!("/plans/{plan}/category_groups"), &json!({ "name": name }))
+    }
+
+    /// Creates a category named `name` at the end of group `group_id`, asserting success.
+    pub fn create_category(&self, plan: &str, group_id: &str, name: &str) -> Value {
+        self.create(&format!("/plans/{plan}/categories"), &json!({ "group_id": group_id, "name": name }))
+    }
+
+    /// `GET /plans/{plan}/accounts`.
+    pub fn accounts(&self, plan: &str) -> Vec<Value> {
+        self.list(&format!("/plans/{plan}/accounts"))
+    }
+
+    /// `GET /plans/{plan}/payees`.
+    pub fn payees(&self, plan: &str) -> Vec<Value> {
+        self.list(&format!("/plans/{plan}/payees"))
+    }
+
+    /// `GET /plans/{plan}/categories`: the plan's groups, each with its categories.
+    pub fn groups(&self, plan: &str) -> Vec<Value> {
+        self.list(&format!("/plans/{plan}/categories"))
+    }
+}
+
+/// Asserts that `res` has `status`, showing the body if it doesn't.
+pub fn assert_status(res: &Response, status: u16, what: &str) {
+    assert_eq!(res.status, status, "{what}: body {:?}", res.text());
+}
+
+/// Asserts that `res` has `status` and a JSON body whose `error` is a non-empty string.
+pub fn assert_error(res: &Response, status: u16, what: &str) {
+    assert_status(res, status, what);
+    let body: Value = serde_json::from_slice(&res.body)
+        .unwrap_or_else(|e| panic!("{what}: error body is not JSON ({e}): {:?}", res.text()));
+    match body.get("error") {
+        Some(Value::String(s)) if !s.is_empty() => {}
+        _ => panic!("{what}: body has no non-empty string `error`: {body}"),
+    }
+}
+
+/// The `id` of `obj`, which must be a non-empty string.
+pub fn id_of(obj: &Value) -> String {
+    match obj.get("id") {
+        Some(Value::String(s)) if !s.is_empty() => s.clone(),
+        _ => panic!("no non-empty string `id` in {obj}"),
+    }
+}
+
+/// The string field `field` of `obj`.
+pub fn str_field(obj: &Value, field: &str) -> String {
+    obj.get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("`{field}` is not a string in {obj}"))
+        .to_owned()
+}
+
+/// The ids of a list of objects, in order.
+pub fn ids_of(list: &[Value]) -> Vec<String> {
+    list.iter().map(id_of).collect()
+}
+
+/// The names of a list of objects, in order.
+pub fn names_of(list: &[Value]) -> Vec<String> {
+    list.iter().map(|v| str_field(v, "name")).collect()
+}
+
+/// Asserts that `obj` is an object with every field in `fields` present (possibly `null`).
+pub fn assert_fields(obj: &Value, fields: &[&str], what: &str) {
+    let map = obj.as_object().unwrap_or_else(|| panic!("{what}: not an object: {obj}"));
+    for field in fields {
+        assert!(map.contains_key(*field), "{what}: lacks field `{field}`: {obj}");
+    }
+}
+
+/// Every response field sections 4 to 7 name.
+const SPEC_FIELDS: [&str; 18] = [
+    "id",
+    "name",
+    "currency_code",
+    "type",
+    "on_budget",
+    "closed",
+    "note",
+    "balance",
+    "cleared_balance",
+    "uncleared_balance",
+    "transfer_payee_id",
+    "payment_category_id",
+    "transfer_account_id",
+    "hidden",
+    "internal",
+    "categories",
+    "group_id",
+    "payment_account_id",
+];
+
+/// `value` with only the object fields the spec names, at every depth. Responses may carry
+/// other fields (SPEC 3.6), so compare objects from different responses through this.
+pub fn spec_fields(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(k, _)| SPEC_FIELDS.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), spec_fields(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(spec_fields).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Asserts that `actual` has everything `expected` has: each field of an expected object,
+/// present with a matching value, and arrays of the same length whose items match in order.
+/// Fields that `expected` doesn't name are allowed (SPEC 3.6).
+pub fn assert_matches(actual: &Value, expected: &Value, what: &str) {
+    fn walk(actual: &Value, expected: &Value, at: &str, what: &str, whole: &Value) {
+        match expected {
+            Value::Object(fields) => {
+                let Some(obj) = actual.as_object() else {
+                    panic!("{what}: {at} is {actual}, expected an object\nwhole: {whole}");
+                };
+                for (key, want) in fields {
+                    let Some(got) = obj.get(key) else {
+                        panic!("{what}: {at} lacks field `{key}`\nwhole: {whole}");
+                    };
+                    walk(got, want, &format!("{at}.{key}"), what, whole);
+                }
+            }
+            Value::Array(items) => {
+                let Some(arr) = actual.as_array() else {
+                    panic!("{what}: {at} is {actual}, expected an array\nwhole: {whole}");
+                };
+                assert_eq!(arr.len(), items.len(), "{what}: {at} has {} items, expected {}\nwhole: {whole}", arr.len(), items.len());
+                for (i, (got, want)) in arr.iter().zip(items).enumerate() {
+                    walk(got, want, &format!("{at}[{i}]"), what, whole);
+                }
+            }
+            _ => assert!(actual == expected, "{what}: {at} is {actual}, expected {expected}\nwhole: {whole}"),
+        }
+    }
+    walk(actual, expected, "body", what, actual);
+}
