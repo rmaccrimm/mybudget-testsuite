@@ -3,7 +3,8 @@
 //! The suite never links the server's code, so nothing the server does at runtime can
 //! reach into the test process.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -87,6 +88,52 @@ fn forward_output(stream: impl Read + Send + 'static, mut first: Option<mpsc::Se
 
 pub use serde_json::{self, Value, json};
 
+/// Bodies larger than this are sent by `Server::request_over_tcp`.
+const LARGE_BODY: usize = 1024 * 1024;
+
+/// Parses a complete HTTP/1.1 response (Content-Length, chunked, or read to EOF).
+fn parse_response(raw: &[u8]) -> Option<Response> {
+    let end = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&raw[..end]).ok()?;
+    let rest = &raw[end + 4..];
+    let mut lines = head.split("\r\n");
+    let status = lines.next()?.split(' ').nth(1)?.parse().ok()?;
+    let mut content_type = None;
+    let mut content_length = None;
+    let mut chunked = false;
+    for line in lines {
+        let (name, value) = line.split_once(':')?;
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-type" => content_type = Some(value.to_owned()),
+            "content-length" => content_length = value.parse::<usize>().ok(),
+            "transfer-encoding" => chunked = value.to_ascii_lowercase().contains("chunked"),
+            _ => {}
+        }
+    }
+    let body = if chunked {
+        let mut body = Vec::new();
+        let mut rest = rest;
+        loop {
+            let line_end = rest.windows(2).position(|w| w == b"\r\n")?;
+            let size = std::str::from_utf8(&rest[..line_end]).ok()?.split(';').next()?.trim();
+            let size = usize::from_str_radix(size, 16).ok()?;
+            rest = &rest[line_end + 2..];
+            if size == 0 {
+                break;
+            }
+            body.extend_from_slice(rest.get(..size)?);
+            rest = rest.get(size + 2..)?;
+        }
+        body
+    } else if let Some(len) = content_length {
+        rest.get(..len)?.to_vec()
+    } else {
+        rest.to_vec()
+    };
+    Some(Response { status, content_type, body })
+}
+
 /// A response read in full: status, `Content-Type` header and body.
 #[derive(Debug)]
 pub struct Response {
@@ -120,6 +167,9 @@ impl Response {
 impl Server {
     /// Sends `method path`, with `body` as a JSON-typed body if given.
     pub fn request_bytes(&self, method: &str, path: &str, body: Option<Vec<u8>>) -> Response {
+        if let Some(body) = body.as_ref().filter(|b| b.len() > LARGE_BODY) {
+            return self.request_over_tcp(method, path, body.clone());
+        }
         let method = reqwest::Method::from_bytes(method.as_bytes()).expect("bad method");
         let mut req = self.client.request(method, self.url(path));
         if let Some(body) = body {
@@ -133,6 +183,42 @@ impl Server {
             .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
         let body = res.bytes().expect("failed to read response body").to_vec();
         Response { status, content_type, body }
+    }
+
+    /// Sends a JSON-typed body over a plain TCP connection, writing it on another thread
+    /// while reading the response. A server may answer a large body (413) before reading
+    /// all of it and close the connection; this still sees that answer.
+    fn request_over_tcp(&self, method: &str, path: &str, body: Vec<u8>) -> Response {
+        let addr = self.base_url.strip_prefix("http://").unwrap().to_owned();
+        let mut stream = TcpStream::connect(&addr).unwrap_or_else(|e| panic!("connect to {addr}: {e}"));
+        stream.set_read_timeout(Some(REQUEST_TIMEOUT)).unwrap();
+        stream.set_write_timeout(Some(REQUEST_TIMEOUT)).unwrap();
+        let head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut writer = stream.try_clone().unwrap();
+        let sender = std::thread::spawn(move || {
+            // The server may stop reading early; write errors are expected then.
+            let _ = writer.write_all(head.as_bytes()).and_then(|_| writer.write_all(&body));
+        });
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+                // A reset after the response arrived still leaves a usable response.
+                Err(_) if !raw.is_empty() => break,
+                Err(e) => panic!("request to {path} failed: no response ({e})"),
+            }
+        }
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        let _ = sender.join();
+        parse_response(&raw).unwrap_or_else(|| {
+            panic!("request to {path}: malformed response {:?}", String::from_utf8_lossy(&raw))
+        })
     }
 
     /// Sends `method path` with a raw text body (which need not be valid JSON).

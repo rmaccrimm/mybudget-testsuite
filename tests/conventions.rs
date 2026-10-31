@@ -661,49 +661,227 @@ fn spec_3_1_accepts_escaped_non_surrogate_characters() {
     assert_eq!(res.json()["currency_code"], "EUR");
 }
 
+// ---- 3.13 ----
+
+const MIB: usize = 1024 * 1024;
+
+fn assert_status_in(res: &Response, allowed: &[u16], what: &str) {
+    assert!(allowed.contains(&res.status), "{what}: status {} not in {allowed:?}, body {:?}", res.status, res.text());
+}
+
+/// `{"name": "<name>", "pad": "xxx…"}` padded to exactly `len` bytes.
+fn padded_body(name: &str, len: usize) -> String {
+    let head = format!(r#"{{"name": "{name}", "pad": ""#);
+    let tail = "\"}";
+    let pad = len - head.len() - tail.len();
+    let body = format!("{head}{}{tail}", "x".repeat(pad));
+    assert_eq!(body.len(), len);
+    body
+}
+
+/// A value nested `depth` containers deep, alternating arrays and objects.
+fn nested(depth: usize) -> String {
+    let mut open = String::new();
+    let mut close = Vec::new();
+    for i in 0..depth {
+        if i % 2 == 0 {
+            open.push('[');
+            close.push(']');
+        } else {
+            open.push_str(r#"{"a":"#);
+            close.push('}');
+        }
+    }
+    let close: String = close.into_iter().rev().collect();
+    format!("{open}1{close}")
+}
+
 #[test]
-fn spec_3_6_ignores_undefined_fields_with_out_of_range_numbers() {
+fn spec_3_13_accepts_body_of_exactly_1_mib() {
     let server = Server::start();
-    let id = server.plan_id("Household");
-    for body in [
-        r#"{"name": "Home", "x": 1e400}"#,
-        r#"{"name": "Home", "x": -1E+999}"#,
-        r#"{"name": "Home", "x": 123456789012345678901234567890123456789012345678901234567890}"#,
-        r#"{"name": "Home", "x": 1e-400}"#,
-        r#"{"name": "Home", "x": [0.1e99999]}"#,
-    ] {
-        assert_status(&server.request_raw("POST", "/plans", body), 201, &format!("POST /plans {body}"));
-        let res = server.request_raw("PATCH", &format!("/plans/{id}"), body);
-        assert_status(&res, 200, &format!("PATCH /plans/{{id}} {body}"));
+    for len in [MIB - 1, MIB] {
+        let res = server.request_raw("POST", "/plans", &padded_body("Home", len));
+        assert_status(&res, 201, &format!("POST /plans with a {len}-byte body"));
+        assert_eq!(res.json()["name"], "Home");
+        let id = res.json()["id"].as_str().unwrap().to_owned();
+        let res = server.request_raw("PATCH", &format!("/plans/{id}"), &padded_body("Other", len));
+        assert_status(&res, 200, &format!("PATCH with a {len}-byte body"));
+        assert_eq!(res.json()["name"], "Other");
     }
 }
 
 #[test]
-fn spec_3_6_ignores_deeply_nested_undefined_field() {
+fn spec_3_13_oversized_body_is_accepted_or_refused_with_413() {
     let server = Server::start();
-    let depth = 1000;
-    let arrays = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
-    let body = format!(r#"{{"name": "Home", "x": {arrays}}}"#);
-    let res = server.request_raw("POST", "/plans", &body);
-    assert_status(&res, 201, "POST /plans with a field nested 1000 deep");
-    assert_eq!(res.json()["name"], "Home");
-    let objects = format!("{}1{}", r#"{"a":"#.repeat(depth), "}".repeat(depth));
     let id = server.plan_id("Household");
-    let body = format!(r#"{{"x": {objects}, "name": "Home"}}"#);
-    let res = server.request_raw("PATCH", &format!("/plans/{id}"), &body);
-    assert_status(&res, 200, "PATCH with a field nested 1000 deep");
-    assert_eq!(res.json()["name"], "Home");
+    for len in [MIB + 1, 4 * MIB] {
+        let res = server.request_raw("POST", "/plans", &padded_body("Home", len));
+        assert_status_in(&res, &[201, 413], &format!("POST /plans with a {len}-byte body"));
+        let res = server.request_raw("PATCH", &format!("/plans/{id}"), &padded_body("Home", len));
+        assert_status_in(&res, &[200, 413], &format!("PATCH with a {len}-byte body"));
+    }
 }
 
 #[test]
-fn spec_3_6_ignores_large_undefined_field() {
+fn spec_3_13_oversized_body_may_get_413_whatever_else_is_wrong() {
     let server = Server::start();
-    let big = "x".repeat(4 * 1024 * 1024);
-    let res = server.post("/plans", &json!({"name": "Home", "attachment": big}));
-    assert_status(&res, 201, "POST /plans with a 4 MiB ignored field");
-    assert_eq!(res.json()["name"], "Home");
-    let id = res.json()["id"].as_str().unwrap().to_owned();
-    let res = server.patch(&format!("/plans/{id}"), &json!({"attachment": big, "name": "Other"}));
-    assert_status(&res, 200, "PATCH with a 4 MiB ignored field");
-    assert_eq!(res.json()["name"], "Other");
+    let id = server.plan_id("Household");
+    let big = "x".repeat(4 * MIB);
+    let invalid = format!(r#"{{"name": "{big}"#);
+    let res = server.request_raw("POST", "/plans", &invalid);
+    assert_status_in(&res, &[400, 413], "oversized invalid JSON");
+    let long_name = format!(r#"{{"name": "{big}"}}"#);
+    let res = server.request_raw("PATCH", &format!("/plans/{id}"), &long_name);
+    assert_status_in(&res, &[400, 413], "oversized name");
+    let res = server.request_raw("PATCH", MISSING, &long_name);
+    assert_status_in(&res, &[404, 413], "oversized PATCH to a missing plan");
+    let res = server.request_raw("PUT", "/plans", &long_name);
+    assert_status_in(&res, &[405, 413], "oversized PUT /plans");
+}
+
+#[test]
+fn spec_3_13_accepts_nesting_64_deep_in_ignored_field() {
+    let server = Server::start();
+    let id = server.plan_id("Household");
+    // The body object itself is one level, so each body nests exactly 64 deep.
+    let mixed = nested(63);
+    let arrays = format!("{}{}", "[".repeat(63), "]".repeat(63));
+    for value in [mixed, arrays] {
+        let body = format!(r#"{{"name": "Home", "x": {value}}}"#);
+        let res = server.request_raw("POST", "/plans", &body);
+        assert_status(&res, 201, "POST /plans with a body nested 64 deep");
+        assert_eq!(res.json()["name"], "Home");
+        let body = format!(r#"{{"x": {value}, "name": "Other"}}"#);
+        let res = server.request_raw("PATCH", &format!("/plans/{id}"), &body);
+        assert_status(&res, 200, "PATCH with a body nested 64 deep");
+        assert_eq!(res.json()["name"], "Other");
+    }
+}
+
+#[test]
+fn spec_3_13_deeper_nesting_is_accepted_or_refused_with_400() {
+    let server = Server::start();
+    let id = server.plan_id("Household");
+    for depth in [65, 1000, 100_000] {
+        let body = format!(r#"{{"name": "Home", "x": {}}}"#, nested(depth));
+        let res = server.request_raw("POST", "/plans", &body);
+        assert_status_in(&res, &[201, 400], &format!("POST /plans nested {depth} deep"));
+        let res = server.request_raw("PATCH", &format!("/plans/{id}"), &body);
+        assert_status_in(&res, &[200, 400], &format!("PATCH nested {depth} deep"));
+        let unclosed = format!(r#"{{"name": "Home", "x": {}"#, "[".repeat(depth));
+        let res = server.request_raw("POST", "/plans", &unclosed);
+        assert_status(&res, 400, &format!("POST /plans with {depth} unclosed arrays"));
+    }
+    assert_status(&server.get(&format!("/plans/{id}")), 200, "server still answers after deep bodies");
+}
+
+#[test]
+fn spec_3_13_accepts_any_finite_number_in_ignored_field() {
+    let server = Server::start();
+    let id = server.plan_id("Household");
+    let digits_300 = format!("1{}", "0".repeat(299));
+    let long_fraction = format!("0.{}1", "0".repeat(400));
+    for value in [
+        "1e308",
+        "-1.7976931348623157e308",
+        "1.7976931348623157E+308",
+        "18446744073709551616",
+        "-9223372036854775809",
+        "123456789012345678901234567890123456789012345678901234567890",
+        digits_300.as_str(),
+        "1.00000000000000000000000000000000000001",
+        "4.9e-324",
+        "1e-400",
+        "-0.0",
+        long_fraction.as_str(),
+        "[1e300, -1e300, {\"a\": 2e-500}]",
+    ] {
+        let body = format!(r#"{{"name": "Home", "x": {value}}}"#);
+        let res = server.request_raw("POST", "/plans", &body);
+        assert_status(&res, 201, &format!("POST /plans {body}"));
+        assert_eq!(res.json()["name"], "Home");
+        let res = server.request_raw("PATCH", &format!("/plans/{id}"), &body);
+        assert_status(&res, 200, &format!("PATCH {body}"));
+    }
+}
+
+#[test]
+fn spec_3_13_too_large_number_is_accepted_or_refused_with_400() {
+    let server = Server::start();
+    let id = server.plan_id("Household");
+    let digits_400 = format!("1{}", "0".repeat(399));
+    for value in ["1e400", "-1E+999", "[0.1e99999]", "{\"a\": 2e309}", digits_400.as_str()] {
+        let body = format!(r#"{{"name": "Home", "x": {value}}}"#);
+        let res = server.request_raw("POST", "/plans", &body);
+        assert_status_in(&res, &[201, 400], &format!("POST /plans {body}"));
+        let res = server.request_raw("PATCH", &format!("/plans/{id}"), &body);
+        assert_status_in(&res, &[200, 400], &format!("PATCH {body}"));
+    }
+}
+
+#[test]
+fn spec_3_13_accepts_any_json_value_in_ignored_field() {
+    let server = Server::start();
+    let id = server.plan_id("Household");
+    let big = "y".repeat(MIB / 2);
+    for value in [
+        json!(null),
+        json!(true),
+        json!(-0.5),
+        json!(""),
+        json!([]),
+        json!({}),
+        json!({"name": 5, "currency_code": null}),
+        json!([null, [false, {"x": [1.5, "s"]}]]),
+        json!(big),
+    ] {
+        let body = json!({"name": "Home", "extra": value});
+        assert_status(&server.post("/plans", &body), 201, "POST /plans with an ignored field");
+        assert_status(&server.patch(&format!("/plans/{id}"), &body), 200, "PATCH with an ignored field");
+    }
+}
+
+// ---- 3.1 / 3.2 / 3.11: refused bodies ----
+
+#[test]
+fn spec_3_2_payload_too_large_413_has_error() {
+    let server = Server::start();
+    let id = server.plan_id("Household");
+    let body = padded_body("Home", 4 * MIB);
+    for (method, path) in [("POST", "/plans".to_owned()), ("PATCH", format!("/plans/{id}"))] {
+        let res = server.request_raw(method, &path, &body);
+        if res.status == 413 {
+            assert_error_body(&res, 413, &format!("{method} {path} with a 4 MiB body"));
+        }
+    }
+}
+
+#[test]
+fn spec_3_1_payload_too_large_413_has_json_content_type() {
+    let server = Server::start();
+    let res = server.request_raw("POST", "/plans", &padded_body("Home", 4 * MIB));
+    if res.status == 413 {
+        assert!(res.is_json_content_type(), "413: Content-Type {:?}", res.content_type);
+    }
+}
+
+#[test]
+fn spec_3_11_refused_oversized_or_deep_body_changes_nothing() {
+    let server = Server::start();
+    let id = server.plan_id("Household");
+    let big = padded_body("Home", 4 * MIB);
+    let deep = format!(r#"{{"name": "Home", "x": {}}}"#, nested(1000));
+    let huge = r#"{"name": "Home", "x": 1e400}"#;
+    for body in [big.as_str(), deep.as_str(), huge] {
+        let before = plans(&server).len();
+        let res = server.request_raw("POST", "/plans", body);
+        if res.status != 201 {
+            assert_eq!(plans(&server).len(), before, "refused POST ({}) created a plan", res.status);
+        }
+        let res = server.request_raw("PATCH", &format!("/plans/{id}"), body);
+        if res.status != 200 {
+            let got = server.get(&format!("/plans/{id}")).json();
+            assert_eq!(got["name"], "Household", "refused PATCH ({}) changed the plan", res.status);
+        }
+    }
 }
