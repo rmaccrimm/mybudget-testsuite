@@ -628,3 +628,82 @@ fn spec_3_12_empty_list_is_json_array() {
     assert_status(&res, 200, "GET /plans");
     assert_eq!(res.json(), json!([]));
 }
+
+// ---- 3.1 / 3.6: valid JSON that a strict parser might still refuse ----
+
+#[test]
+fn spec_3_1_accepts_backslash_escaped_surrogate_pairs() {
+    let server = Server::start();
+    for (body, name) in [
+        (r#"{"name": "a😀b"}"#, "a😀b"),
+        (r#"{"name": "💶"}"#, "💶"),
+        (r#"{"name": "𐀀"}"#, "\u{10000}"),
+        (r#"{"name": "􏿿"}"#, "\u{10ffff}"),
+    ] {
+        let res = server.request_raw("POST", "/plans", body);
+        assert_status(&res, 201, &format!("POST /plans {body}"));
+        assert_eq!(res.json()["name"], name, "POST /plans {body}");
+    }
+    let id = server.plan_id("Household");
+    let body = r#"{"name": "x😀", "y𐀀": "z"}"#;
+    let res = server.request_raw("PATCH", &format!("/plans/{id}"), body);
+    assert_status(&res, 200, "PATCH with escaped surrogate pairs");
+    assert_eq!(res.json()["name"], "x😀");
+}
+
+#[test]
+fn spec_3_1_accepts_escaped_non_surrogate_characters() {
+    let server = Server::start();
+    let body = r#"{"name": "Homeé￿", "currency_code": "EUR"}"#;
+    let res = server.request_raw("POST", "/plans", body);
+    assert_status(&res, 201, "POST /plans with \\u escapes");
+    assert_eq!(res.json()["name"], "Homeé\u{ffff}");
+    assert_eq!(res.json()["currency_code"], "EUR");
+}
+
+#[test]
+fn spec_3_6_ignores_undefined_fields_with_out_of_range_numbers() {
+    let server = Server::start();
+    let id = server.plan_id("Household");
+    for body in [
+        r#"{"name": "Home", "x": 1e400}"#,
+        r#"{"name": "Home", "x": -1E+999}"#,
+        r#"{"name": "Home", "x": 123456789012345678901234567890123456789012345678901234567890}"#,
+        r#"{"name": "Home", "x": 1e-400}"#,
+        r#"{"name": "Home", "x": [0.1e99999]}"#,
+    ] {
+        assert_status(&server.request_raw("POST", "/plans", body), 201, &format!("POST /plans {body}"));
+        let res = server.request_raw("PATCH", &format!("/plans/{id}"), body);
+        assert_status(&res, 200, &format!("PATCH /plans/{{id}} {body}"));
+    }
+}
+
+#[test]
+fn spec_3_6_ignores_deeply_nested_undefined_field() {
+    let server = Server::start();
+    let depth = 1000;
+    let arrays = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+    let body = format!(r#"{{"name": "Home", "x": {arrays}}}"#);
+    let res = server.request_raw("POST", "/plans", &body);
+    assert_status(&res, 201, "POST /plans with a field nested 1000 deep");
+    assert_eq!(res.json()["name"], "Home");
+    let objects = format!("{}1{}", r#"{"a":"#.repeat(depth), "}".repeat(depth));
+    let id = server.plan_id("Household");
+    let body = format!(r#"{{"x": {objects}, "name": "Home"}}"#);
+    let res = server.request_raw("PATCH", &format!("/plans/{id}"), &body);
+    assert_status(&res, 200, "PATCH with a field nested 1000 deep");
+    assert_eq!(res.json()["name"], "Home");
+}
+
+#[test]
+fn spec_3_6_ignores_large_undefined_field() {
+    let server = Server::start();
+    let big = "x".repeat(4 * 1024 * 1024);
+    let res = server.post("/plans", &json!({"name": "Home", "attachment": big}));
+    assert_status(&res, 201, "POST /plans with a 4 MiB ignored field");
+    assert_eq!(res.json()["name"], "Home");
+    let id = res.json()["id"].as_str().unwrap().to_owned();
+    let res = server.patch(&format!("/plans/{id}"), &json!({"attachment": big, "name": "Other"}));
+    assert_status(&res, 200, "PATCH with a 4 MiB ignored field");
+    assert_eq!(res.json()["name"], "Other");
+}
