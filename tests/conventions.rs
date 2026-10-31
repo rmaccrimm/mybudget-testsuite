@@ -91,6 +91,68 @@ fn spec_3_1_accepts_non_ascii_utf8_body() {
     assert_eq!(res.json()["name"], "Ménage 家計 💶");
 }
 
+// Bodies whose strings hold an escaped lone surrogate, each otherwise a valid plan.
+const LONE_SURROGATE_BODIES: [&str; 6] = [
+    r#"{"name": "a\ud800b"}"#,
+    r#"{"name": "a\uDC00b"}"#,
+    r#"{"name": "Household\ud83d"}"#,
+    r#"{"name": "\ude00\ud83d"}"#,
+    r#"{"name": "\ud800A"}"#,
+    r#"{"name": "Household", "currency_code": "U\ud800D"}"#,
+];
+
+#[test]
+fn spec_3_1_lone_surrogate_in_post_returns_400() {
+    let server = Server::start();
+    for body in LONE_SURROGATE_BODIES {
+        assert_status(&server.request_raw("POST", "/plans", body), 400, &format!("POST /plans {body}"));
+    }
+    assert!(plans(&server).is_empty(), "lone-surrogate POSTs created plans: {:?}", plans(&server));
+}
+
+#[test]
+fn spec_3_1_lone_surrogate_in_patch_returns_400() {
+    let server = Server::start();
+    let id = server.plan_id("Household");
+    for body in LONE_SURROGATE_BODIES {
+        let res = server.request_raw("PATCH", &format!("/plans/{id}"), body);
+        assert_status(&res, 400, &format!("PATCH /plans/{{id}} {body}"));
+    }
+    let got = server.get(&format!("/plans/{id}")).json();
+    assert_eq!(got["name"], "Household");
+    assert_eq!(got["currency_code"], "USD");
+}
+
+#[test]
+fn spec_3_1_lone_surrogate_in_ignored_field_returns_400() {
+    let server = Server::start();
+    let id = server.plan_id("Household");
+    for body in [
+        r#"{"name": "Home", "note": "x\ud800"}"#,
+        r#"{"name": "Home", "extra": {"deep": ["ok", "\udfff"]}}"#,
+        r#"{"name": "Home", "\ud800": 1}"#,
+        r#"{"name": "Home", "a\udc00b": "x"}"#,
+    ] {
+        assert_status(&server.request_raw("POST", "/plans", body), 400, &format!("POST /plans {body}"));
+        let res = server.request_raw("PATCH", &format!("/plans/{id}"), body);
+        assert_status(&res, 400, &format!("PATCH /plans/{{id}} {body}"));
+    }
+    assert_eq!(plans(&server).len(), 1, "lone-surrogate POSTs created plans");
+    assert_eq!(server.get(&format!("/plans/{id}")).json()["name"], "Household");
+}
+
+#[test]
+fn spec_3_1_accepts_escaped_surrogate_pair() {
+    let server = Server::start();
+    let res = server.request_raw("POST", "/plans", r#"{"name": "a😀b"}"#);
+    assert_status(&res, 201, "POST /plans with an escaped surrogate pair");
+    assert_eq!(res.json()["name"], "a😀b");
+    let id = res.json()["id"].as_str().unwrap().to_owned();
+    let res = server.request_raw("PATCH", &format!("/plans/{id}"), r#"{"name": "💶", "x": "𐀀"}"#);
+    assert_status(&res, 200, "PATCH with escaped surrogate pairs");
+    assert_eq!(res.json()["name"], "💶");
+}
+
 // ---- 3.2 ----
 
 #[test]
@@ -431,13 +493,6 @@ fn spec_3_9_plans_may_share_a_name() {
     assert_status(&res, 200, "rename");
     let res = server.patch(&format!("/plans/{a}"), &json!({"name": "Household"}));
     assert_status(&res, 200, "rename back to a shared name");
-}
-
-#[test]
-fn spec_3_9_rejects_lone_surrogate_in_name() {
-    let server = Server::start();
-    let res = server.request_raw("POST", "/plans", "{\"name\": \"a\\ud800b\"}");
-    assert_status(&res, 400, "name with a lone surrogate");
 }
 
 // ---- 3.10 ----
