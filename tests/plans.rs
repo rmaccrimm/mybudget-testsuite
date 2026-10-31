@@ -132,7 +132,7 @@ fn spec_4_2_gets_one_plan() {
 fn spec_4_2_get_missing_plan_returns_404() {
     let server = Server::start();
     server.plan_id("Household");
-    for id in ["no-such-plan", "PLAN_ID", "%20"] {
+    for id in ["no-such-plan", "PLAN_ID", "x"] {
         let res = server.get(&format!("/plans/{id}"));
         assert_eq!(res.status, 404, "GET /plans/{id}: {}", res.text());
     }

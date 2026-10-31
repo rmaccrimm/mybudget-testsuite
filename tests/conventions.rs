@@ -339,6 +339,30 @@ fn spec_3_5_ids_are_unique_strings() {
 }
 
 #[test]
+fn spec_3_5_ids_use_only_path_safe_ascii_and_work_in_paths() {
+    let server = Server::start();
+    for name in ["Household", "Ünïcödé / name?#%", " spaced "] {
+        let plan = server.create_plan(&json!({"name": name}));
+        let id = plan["id"].as_str().unwrap_or_else(|| panic!("id is not a string: {plan}"));
+        assert!(
+            id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "id {id:?} has characters other than ASCII letters, digits, - and _"
+        );
+        let res = server.get(&format!("/plans/{id}"));
+        assert_status(&res, 200, &format!("GET /plans/{id}"));
+        assert_eq!(res.json()["id"], id);
+    }
+    let listed = server.get("/plans").json();
+    for plan in listed.as_array().unwrap() {
+        let id = plan["id"].as_str().unwrap();
+        assert!(
+            id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "listed id {id:?} has characters other than ASCII letters, digits, - and _"
+        );
+    }
+}
+
+#[test]
 fn spec_3_5_ids_are_not_reused_after_delete() {
     let server = Server::start();
     let mut deleted = Vec::new();
