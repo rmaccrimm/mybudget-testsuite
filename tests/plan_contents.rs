@@ -668,6 +668,61 @@ fn spec_3_6_patches_ignore_undefined_fields() {
 }
 
 #[test]
+fn spec_3_6_defined_field_is_checked_even_when_unused() {
+    // With a zero starting balance, POST /accounts leaves `starting_date` unused (5.2), but it
+    // is a field the endpoint defines, so an invalid value still returns 400.
+    let server = Server::start();
+    let f = Fixture::new(&server, "Household");
+    for date in [
+        json!(null),
+        json!("2026-02-30"),
+        json!("2026-10-1"),
+        json!("3000-01-01"),
+        json!("today"),
+        json!(20261001),
+        json!(false),
+        json!({}),
+    ] {
+        for body in [
+            json!({"name": "Savings", "type": "savings", "starting_balance": 0, "starting_date": date}),
+            json!({"name": "Mastercard", "type": "lineOfCredit", "starting_date": date}),
+            json!({"name": "House", "type": "otherAsset", "starting_balance": 0, "starting_date": date, "note": "n"}),
+        ] {
+            assert_status(&server.post(&f.path("/accounts"), &body), 400, &format!("POST {body}"));
+        }
+    }
+}
+
+#[test]
+fn spec_3_6_fields_defined_only_by_other_endpoints_are_ignored() {
+    // `starting_balance` and `starting_date` are defined by POST /accounts (5.2), and
+    // `payee_name` only by requests that take `payee_id` (6.5), which none of these do.
+    // Where an endpoint doesn't define them they're ignored, whatever they hold.
+    let server = Server::start();
+    let f = Fixture::new(&server, "Household");
+    let before = f.snapshot(&server);
+    for (path, body) in [
+        (f.account(), json!({"starting_balance": 5, "starting_date": "2026-02-30"})),
+        (f.visa_account(), json!({"starting_balance": "x", "starting_date": null})),
+        (f.payee(), json!({"payee_name": 5, "payee_id": null})),
+        (f.transfer_payee(), json!({"payee_name": "", "payee_id": "nope"})),
+        (f.group(), json!({"starting_date": null})),
+        (f.category(), json!({"starting_date": 7, "payee_name": null})),
+    ] {
+        assert_status(&server.patch(&path, &body), 200, &format!("PATCH {path} {body}"));
+    }
+    assert_eq!(f.snapshot(&server), before, "undefined PATCH fields changed something");
+    let payee = server.create(&f.path("/payees"), &json!({"name": "Bakery", "payee_name": 5, "payee_id": "nope"}));
+    assert_matches(&payee, &json!({"name": "Bakery", "transfer_account_id": null}), "POST payee");
+    let group = server.create(&f.path("/category_groups"), &json!({"name": "Fun", "starting_date": null}));
+    assert_matches(&group, &json!({"name": "Fun", "categories": []}), "POST group");
+    let body = json!({"group_id": id_of(&group), "name": "Games", "starting_balance": 1.5, "payee_name": ""});
+    assert_matches(&server.create(&f.path("/categories"), &body), &json!({"name": "Games"}), "POST category");
+    let body = json!({"name": "Cash", "type": "cash", "payee_name": 5, "payee_id": []});
+    assert_matches(&server.create(&f.path("/accounts"), &body), &json!({"name": "Cash", "balance": 0}), "POST account");
+}
+
+#[test]
 fn spec_3_6_plan_content_lists_ignore_query_parameters() {
     let server = Server::start();
     let f = Fixture::new(&server, "Household");
@@ -879,6 +934,20 @@ fn spec_3_10_null_for_non_nullable_plan_content_fields_returns_400() {
 }
 
 #[test]
+fn spec_3_10_null_starting_date_returns_400_even_when_unused() {
+    // `starting_date` isn't nullable (5.2), and a zero balance doesn't make it so.
+    let server = Server::start();
+    let plan = server.plan_id("Household");
+    for body in [
+        json!({"name": "A", "type": "checking", "starting_balance": 0, "starting_date": null}),
+        json!({"name": "A", "type": "creditCard", "starting_date": null}),
+        json!({"name": "A", "type": "otherLiability", "starting_balance": 0, "starting_date": null, "note": null}),
+    ] {
+        assert_status(&server.post(&format!("/plans/{plan}/accounts"), &body), 400, &format!("POST {body}"));
+    }
+}
+
+#[test]
 fn spec_3_10_null_note_clears_it() {
     let server = Server::start();
     let f = Fixture::new(&server, "Household");
@@ -958,6 +1027,30 @@ fn spec_3_11_failed_account_post_creates_nothing() {
     assert_eq!(names_of(&server.payees(&plan)), ["Transfer : Visa", "Starting Balance"]);
     let listed = server.groups(&plan)[0]["categories"].clone();
     assert_eq!(ids_of(listed.as_array().unwrap()), [str_field(&visa, "payment_category_id")]);
+}
+
+#[test]
+fn spec_3_11_failed_zero_balance_account_post_creates_nothing() {
+    // An invalid unused `starting_date` (5.2) fails the POST, so no account, transfer payee
+    // or payment category appears.
+    let server = Server::start();
+    let f = Fixture::new(&server, "Household");
+    let before = f.snapshot(&server);
+    for body in [
+        json!({"name": "Amex", "type": "creditCard", "starting_balance": 0, "starting_date": "2026-02-30"}),
+        json!({"name": "Amex", "type": "lineOfCredit", "starting_date": null}),
+        json!({"name": "Wallet", "type": "cash", "starting_balance": 0, "starting_date": 5}),
+        json!({"name": "Car", "type": "otherAsset", "starting_date": "1899-12-31"}),
+    ] {
+        assert_status(&server.post(&f.path("/accounts"), &body), 400, &format!("POST {body}"));
+        assert_eq!(f.snapshot(&server), before, "POST {body} changed the plan");
+    }
+    let amex = server.add_account(&f.plan, "Amex", "creditCard", 0);
+    let transfer_names: Vec<String> = names_of(&server.payees(&f.plan)).into_iter().filter(|n| n == "Transfer : Amex").collect();
+    assert_eq!(transfer_names.len(), 1, "payees: {:?}", server.payees(&f.plan));
+    let payment = server.groups(&f.plan)[0]["categories"].clone();
+    let payment_ids = ids_of(payment.as_array().unwrap());
+    assert_eq!(payment_ids, [str_field(&f.visa, "payment_category_id"), str_field(&amex, "payment_category_id")]);
 }
 
 #[test]

@@ -237,12 +237,67 @@ fn spec_5_2_starting_date_is_unused_when_balance_is_zero() {
         json!({"name": "A", "type": "checking", "starting_balance": 0, "starting_date": "2026-10-01"}),
         json!({"name": "B", "type": "creditCard", "starting_date": "2026-10-01"}),
         json!({"name": "C", "type": "otherAsset", "starting_balance": 0, "starting_date": "1900-01-01"}),
+        json!({"name": "D", "type": "lineOfCredit", "starting_balance": 0, "starting_date": "2999-12-31"}),
+        json!({"name": "E", "type": "otherLiability", "starting_date": "2024-02-29"}),
     ] {
         let res = server.post(&accounts_url(&plan), &body);
         assert_status(&res, 201, &format!("POST {body}"));
         assert_matches(&res.json(), &json!({"balance": 0, "cleared_balance": 0, "uncleared_balance": 0}), "POST");
     }
     assert!(starting_balance_payees(&server, &plan).is_empty(), "a zero starting balance made a transaction");
+}
+
+#[test]
+fn spec_5_2_unused_starting_date_must_not_be_null() {
+    // `starting_date` isn't nullable, so `null` returns 400 even when the balance is 0 and
+    // leaves the date unused. `-0` is 0 (3.7).
+    let server = Server::start();
+    let plan = server.plan_id("Household");
+    let url = accounts_url(&plan);
+    for ty in ["checking", "creditCard", "otherAsset"] {
+        for balance in ["", r#", "starting_balance": 0"#, r#", "starting_balance": -0"#] {
+            let body = format!(r#"{{"name": "Account", "type": "{ty}"{balance}, "starting_date": null}}"#);
+            assert_status(&server.request_raw("POST", &url, &body), 400, &format!("POST {body}"));
+        }
+    }
+    assert!(server.accounts(&plan).is_empty(), "rejected POSTs created accounts");
+}
+
+#[test]
+fn spec_5_2_unused_starting_date_must_still_be_a_date() {
+    let server = Server::start();
+    let plan = server.plan_id("Household");
+    let dates = [
+        json!("2026-02-30"),
+        json!("2026-02-29"),
+        json!("2026-04-31"),
+        json!("2026-13-01"),
+        json!("2026-10-00"),
+        json!("1899-12-31"),
+        json!("3000-01-01"),
+        json!("2026-10-1"),
+        json!("2026/10/01"),
+        json!("2026-10"),
+        json!("2026-10-01T00:00:00Z"),
+        json!(" 2026-10-01"),
+        json!(""),
+        json!(20261001),
+        json!(0),
+        json!(true),
+        json!(["2026-10-01"]),
+        json!({"date": "2026-10-01"}),
+    ];
+    for ty in ["checking", "creditCard", "otherLiability"] {
+        for date in &dates {
+            for body in [
+                json!({"name": "Account", "type": ty, "starting_balance": 0, "starting_date": date}),
+                json!({"name": "Account", "type": ty, "starting_date": date}),
+            ] {
+                assert_status(&server.post(&accounts_url(&plan), &body), 400, &format!("POST {body}"));
+            }
+        }
+    }
+    assert!(server.accounts(&plan).is_empty(), "rejected POSTs created accounts");
 }
 
 #[test]

@@ -124,6 +124,46 @@ fn spec_3_7_accepts_negative_zero_amount() {
     assert_eq!(account_count(&server, &plan), 2);
 }
 
+#[test]
+fn spec_3_7_negative_zero_means_zero() {
+    // A `-0` starting balance is a zero one: it needs no date and creates no transaction
+    // (5.2, 5.3), so there's no Starting Balance payee and the account can be deleted (5.9).
+    let server = Server::start();
+    let plan = server.plan_id("Household");
+    let url = format!("/plans/{plan}/accounts");
+    let mut ids = Vec::new();
+    for body in [
+        r#"{"name": "A", "type": "checking", "starting_balance": -0}"#,
+        r#"{"name": "B", "type": "creditCard", "starting_balance": -0}"#,
+        r#"{"name": "C", "type": "lineOfCredit", "starting_balance": -0, "starting_date": "2026-10-01"}"#,
+        r#"{"name": "D", "type": "otherLiability", "starting_balance": -0, "starting_date": "2026-10-01"}"#,
+    ] {
+        let res = server.request_raw("POST", &url, body);
+        assert_status(&res, 201, &format!("POST {body}"));
+        let account = res.json();
+        let id = account["id"].as_str().unwrap_or_else(|| panic!("no id in {account}")).to_owned();
+        let got = server.get(&format!("{url}/{id}"));
+        assert_status(&got, 200, &format!("GET the account from {body}"));
+        for (what, account) in [("POST", account), ("GET", got.json())] {
+            for field in ["balance", "cleared_balance", "uncleared_balance"] {
+                assert_eq!(account[field], json!(0), "{what} after {body}: {field} in {account}");
+            }
+        }
+        ids.push(id);
+    }
+    let payees = server.list(&format!("/plans/{plan}/payees"));
+    assert!(
+        payees.iter().all(|p| p["name"] != "Starting Balance"),
+        "a -0 starting balance made a transaction: {payees:?}"
+    );
+    assert_eq!(payees.len(), ids.len(), "expected only transfer payees: {payees:?}");
+    for id in ids {
+        let res = server.delete(&format!("{url}/{id}"));
+        assert_status(&res, 204, &format!("DELETE account {id} (a -0 starting balance is no transaction)"));
+    }
+    assert_eq!(account_count(&server, &plan), 0);
+}
+
 // ---- 3.8 ----
 
 #[test]
