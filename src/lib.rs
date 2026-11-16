@@ -664,6 +664,118 @@ impl Budget {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helpers for months (section 11).
+
+/// Every field a month response has (11.8's example).
+pub const MONTH_FIELDS: [&str; 10] = [
+    "month",
+    "income",
+    "cash_advances",
+    "assigned",
+    "activity",
+    "cash_overspending_last_month",
+    "left_over_from_last_month",
+    "assigned_in_future",
+    "ready_to_assign",
+    "categories",
+];
+
+/// Every field a category's month entry has (11.2's example).
+pub const MONTH_ENTRY_FIELDS: [&str; 6] =
+    ["category_id", "assigned", "activity", "available", "cash_overspending", "credit_overspending"];
+
+/// `/plans/{plan}/months/{month}`.
+pub fn month_path(plan: &str, month: &str) -> String {
+    format!("/plans/{plan}/months/{month}")
+}
+
+/// `/plans/{plan}/months/{month}/categories/{category}`.
+pub fn entry_path(plan: &str, month: &str, category: &str) -> String {
+    format!("/plans/{plan}/months/{month}/categories/{category}")
+}
+
+/// The month entry (11.3) of a category with no spending in credit accounts.
+pub fn entry(category: &str, assigned: i64, activity: i64, available: i64, cash_overspending: i64) -> Value {
+    json!({"category_id": category, "assigned": assigned, "activity": activity, "available": available,
+           "cash_overspending": cash_overspending, "credit_overspending": 0})
+}
+
+impl Server {
+    /// `GET /plans/{plan}/months/{month}`, asserting `200`.
+    pub fn month(&self, plan: &str, month: &str) -> Value {
+        self.get_json(&month_path(plan, month))
+    }
+
+    /// `GET /plans/{plan}/months/{month}/categories/{category}`, asserting `200`.
+    pub fn month_entry(&self, plan: &str, month: &str, category: &str) -> Value {
+        self.get_json(&entry_path(plan, month, category))
+    }
+
+    /// `PATCH` a category's `assigned` for a month, asserting `200`; returns the entry.
+    pub fn assign(&self, plan: &str, month: &str, category: &str, assigned: i64) -> Value {
+        self.patch_ok(&entry_path(plan, month, category), &json!({ "assigned": assigned }))
+    }
+}
+
+/// A plan without credit accounts (section 11 leaves their months to section 12): one
+/// account of each cash and tracking type, all with zero starting balances, and a group
+/// `Everyday` holding `Groceries` and `Household`.
+pub struct CashBudget {
+    pub plan: String,
+    /// `checking`
+    pub checking: Acct,
+    /// `savings`
+    pub savings: Acct,
+    /// `cash`
+    pub wallet: Acct,
+    /// `otherAsset`
+    pub house: Acct,
+    /// `otherLiability`
+    pub mortgage: Acct,
+    pub group: String,
+    pub groceries: String,
+    pub household: String,
+}
+
+impl CashBudget {
+    pub fn new(server: &Server) -> CashBudget {
+        let plan = server.plan_id("Household");
+        let checking = Acct::from(&server.add_account(&plan, "Checking", "checking", 0));
+        let savings = Acct::from(&server.add_account(&plan, "Savings", "savings", 0));
+        let wallet = Acct::from(&server.add_account(&plan, "Wallet", "cash", 0));
+        let house = Acct::from(&server.add_account(&plan, "House", "otherAsset", 0));
+        let mortgage = Acct::from(&server.add_account(&plan, "Mortgage", "otherLiability", 0));
+        let group = id_of(&server.create_group(&plan, "Everyday"));
+        let groceries = id_of(&server.create_category(&plan, &group, "Groceries"));
+        let household = id_of(&server.create_category(&plan, &group, "Household"));
+        CashBudget { plan, checking, savings, wallet, house, mortgage, group, groceries, household }
+    }
+
+    /// Creates a transaction of `amount` in `account` on `date` with `category`; returns it.
+    pub fn txn(&self, server: &Server, account: &Acct, date: &str, amount: i64, category: &str) -> Value {
+        server.create_transaction(
+            &self.plan,
+            &json!({"account_id": account.id, "date": date, "amount": amount, "category_id": category}),
+        )
+    }
+
+    /// `GET` the month.
+    pub fn month(&self, server: &Server, month: &str) -> Value {
+        server.month(&self.plan, month)
+    }
+
+    /// `GET` a category's month entry.
+    pub fn entry(&self, server: &Server, month: &str, category: &str) -> Value {
+        server.month_entry(&self.plan, month, category)
+    }
+
+    /// Sets a category's `assigned` for a month.
+    pub fn assign(&self, server: &Server, month: &str, category: &str, assigned: i64) -> Value {
+        server.assign(&self.plan, month, category, assigned)
+    }
+}
+
 /// `base` with `field` set to `value`, or removed if `value` is `None`.
 pub fn with(base: &Value, field: &str, value: Option<Value>) -> Value {
     let mut body = base.clone();
