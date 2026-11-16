@@ -412,8 +412,19 @@ pub fn assert_fields(obj: &Value, fields: &[&str], what: &str) {
     }
 }
 
-/// Every response field sections 4 to 7 name.
-const SPEC_FIELDS: [&str; 18] = [
+/// Every response field sections 4 to 10 name.
+const SPEC_FIELDS: [&str; 29] = [
+    "account_id",
+    "date",
+    "amount",
+    "payee_id",
+    "category_id",
+    "memo",
+    "cleared",
+    "approved",
+    "flag_color",
+    "transfer_transaction_id",
+    "subtransactions",
     "id",
     "name",
     "currency_code",
@@ -479,4 +490,201 @@ pub fn assert_matches(actual: &Value, expected: &Value, what: &str) {
         }
     }
     walk(actual, expected, "body", what, actual);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for transactions (sections 8 to 10).
+
+/// Every field a transaction response has (8.1's example).
+pub const TRANSACTION_FIELDS: [&str; 13] = [
+    "id",
+    "account_id",
+    "date",
+    "amount",
+    "payee_id",
+    "category_id",
+    "memo",
+    "cleared",
+    "approved",
+    "flag_color",
+    "transfer_account_id",
+    "transfer_transaction_id",
+    "subtransactions",
+];
+
+impl Server {
+    /// `POST /plans/{plan}/transactions body`, whatever the outcome.
+    pub fn post_transaction(&self, plan: &str, body: &Value) -> Response {
+        self.post(&format!("/plans/{plan}/transactions"), body)
+    }
+
+    /// Creates a transaction, asserting `201`; returns it.
+    pub fn create_transaction(&self, plan: &str, body: &Value) -> Value {
+        self.create(&format!("/plans/{plan}/transactions"), body)
+    }
+
+    /// `PATCH /plans/{plan}/transactions/{id} body`, whatever the outcome.
+    pub fn patch_transaction(&self, plan: &str, id: &str, body: &Value) -> Response {
+        self.patch(&format!("/plans/{plan}/transactions/{id}"), body)
+    }
+
+    /// `PATCH` a transaction, asserting `200`; returns it.
+    pub fn patch_transaction_ok(&self, plan: &str, id: &str, body: &Value) -> Value {
+        self.patch_ok(&format!("/plans/{plan}/transactions/{id}"), body)
+    }
+
+    /// `GET /plans/{plan}/transactions/{id}`, asserting `200`.
+    pub fn transaction(&self, plan: &str, id: &str) -> Value {
+        self.get_json(&format!("/plans/{plan}/transactions/{id}"))
+    }
+
+    /// `GET /plans/{plan}/transactions/{id}`, whatever the outcome.
+    pub fn get_transaction(&self, plan: &str, id: &str) -> Response {
+        self.get(&format!("/plans/{plan}/transactions/{id}"))
+    }
+
+    /// `DELETE /plans/{plan}/transactions/{id}`, whatever the outcome.
+    pub fn delete_transaction(&self, plan: &str, id: &str) -> Response {
+        self.delete(&format!("/plans/{plan}/transactions/{id}"))
+    }
+
+    /// `GET /plans/{plan}/transactions`.
+    pub fn transactions(&self, plan: &str) -> Vec<Value> {
+        self.list(&format!("/plans/{plan}/transactions"))
+    }
+
+    /// `GET /plans/{plan}/transactions?{query}`.
+    pub fn transactions_where(&self, plan: &str, query: &str) -> Vec<Value> {
+        self.list(&format!("/plans/{plan}/transactions?{query}"))
+    }
+
+    /// `GET /plans/{plan}/accounts/{id}`, asserting `200`.
+    pub fn account(&self, plan: &str, id: &str) -> Value {
+        self.get_json(&format!("/plans/{plan}/accounts/{id}"))
+    }
+
+    /// The account's `(balance, cleared_balance, uncleared_balance)`.
+    pub fn balances(&self, plan: &str, id: &str) -> (i64, i64, i64) {
+        let a = self.account(plan, id);
+        let get = |f: &str| a[f].as_i64().unwrap_or_else(|| panic!("`{f}` isn't an integer: {a}"));
+        (get("balance"), get("cleared_balance"), get("uncleared_balance"))
+    }
+
+    /// Everything the plan's list endpoints return, to compare before and after.
+    pub fn plan_snapshot(&self, plan: &str) -> Value {
+        json!({
+            "accounts": self.accounts(plan),
+            "payees": self.payees(plan),
+            "categories": self.groups(plan),
+            "transactions": self.transactions(plan),
+        })
+    }
+}
+
+/// An account's id and its transfer payee's id.
+#[derive(Clone, Debug)]
+pub struct Acct {
+    pub id: String,
+    pub payee: String,
+}
+
+impl Acct {
+    pub fn from(account: &Value) -> Acct {
+        Acct { id: id_of(account), payee: str_field(account, "transfer_payee_id") }
+    }
+}
+
+/// A plan with one account of each type, all with zero starting balances (so no
+/// transactions), and a group `Everyday` holding `Groceries` and `Household`.
+pub struct Budget {
+    pub plan: String,
+    /// `checking`
+    pub checking: Acct,
+    /// `savings`
+    pub savings: Acct,
+    /// `cash`
+    pub wallet: Acct,
+    /// `creditCard`
+    pub visa: Acct,
+    /// Visa's payment category.
+    pub visa_payment: String,
+    /// `lineOfCredit`
+    pub loc: Acct,
+    /// `otherAsset`
+    pub house: Acct,
+    /// `otherLiability`
+    pub mortgage: Acct,
+    pub group: String,
+    pub groceries: String,
+    pub household: String,
+}
+
+impl Budget {
+    pub fn new(server: &Server) -> Budget {
+        let plan = server.plan_id("Household");
+        let checking = server.add_account(&plan, "Checking", "checking", 0);
+        let savings = server.add_account(&plan, "Savings", "savings", 0);
+        let wallet = server.add_account(&plan, "Wallet", "cash", 0);
+        let visa = server.add_account(&plan, "Visa", "creditCard", 0);
+        let loc = server.add_account(&plan, "Credit Line", "lineOfCredit", 0);
+        let house = server.add_account(&plan, "House", "otherAsset", 0);
+        let mortgage = server.add_account(&plan, "Mortgage", "otherLiability", 0);
+        let group = id_of(&server.create_group(&plan, "Everyday"));
+        let groceries = id_of(&server.create_category(&plan, &group, "Groceries"));
+        let household = id_of(&server.create_category(&plan, &group, "Household"));
+        Budget {
+            visa_payment: str_field(&visa, "payment_category_id"),
+            checking: Acct::from(&checking),
+            savings: Acct::from(&savings),
+            wallet: Acct::from(&wallet),
+            visa: Acct::from(&visa),
+            loc: Acct::from(&loc),
+            house: Acct::from(&house),
+            mortgage: Acct::from(&mortgage),
+            plan,
+            group,
+            groceries,
+            household,
+        }
+    }
+
+    /// `/plans/{plan}{rest}`.
+    pub fn path(&self, rest: &str) -> String {
+        format!("/plans/{}{rest}", self.plan)
+    }
+
+    /// `/plans/{plan}/transactions/{id}`.
+    pub fn txn_path(&self, id: &str) -> String {
+        self.path(&format!("/transactions/{id}"))
+    }
+
+    /// A valid body for spending `amount` (negative) from Checking on Groceries.
+    pub fn spend(&self, amount: i64) -> Value {
+        json!({"account_id": self.checking.id, "date": "2026-10-04", "amount": amount, "category_id": self.groceries})
+    }
+}
+
+/// `base` with `field` set to `value`, or removed if `value` is `None`.
+pub fn with(base: &Value, field: &str, value: Option<Value>) -> Value {
+    let mut body = base.clone();
+    let map = body.as_object_mut().expect("base isn't an object");
+    match value {
+        Some(v) => {
+            map.insert(field.to_owned(), v);
+        }
+        None => {
+            map.remove(field);
+        }
+    }
+    body
+}
+
+/// `base` with every field of `extra` (an object) added or replaced.
+pub fn merged(base: &Value, extra: &Value) -> Value {
+    let mut body = base.clone();
+    let map = body.as_object_mut().expect("base isn't an object");
+    for (k, v) in extra.as_object().expect("extra isn't an object") {
+        map.insert(k.clone(), v.clone());
+    }
+    body
 }
