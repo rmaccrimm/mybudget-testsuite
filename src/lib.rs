@@ -776,6 +776,170 @@ impl CashBudget {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Helpers for credit accounts in months (sections 11 and 12).
+
+/// A category's month entry (11.3), with both overspending fields.
+pub fn credit_entry(
+    category: &str,
+    assigned: i64,
+    activity: i64,
+    available: i64,
+    cash_overspending: i64,
+    credit_overspending: i64,
+) -> Value {
+    json!({"category_id": category, "assigned": assigned, "activity": activity, "available": available,
+           "cash_overspending": cash_overspending, "credit_overspending": credit_overspending})
+}
+
+/// The month entry of a category with nothing in it.
+pub fn zero_entry(category: &str) -> Value {
+    credit_entry(category, 0, 0, 0, 0, 0)
+}
+
+/// Asserts 11.7's closing identity on a month: `ready_to_assign` = `left_over_from_last_month`
+/// + `income` + `cash_advances` - `cash_overspending_last_month` - `assigned`
+/// - `assigned_in_future`, with `assigned_in_future` never negative.
+pub fn assert_month_identity(m: &Value) {
+    let f = |k: &str| m[k].as_i64().unwrap_or_else(|| panic!("`{k}` isn't an integer: {m}"));
+    let expected = f("left_over_from_last_month") + f("income") + f("cash_advances")
+        - f("cash_overspending_last_month")
+        - f("assigned")
+        - f("assigned_in_future");
+    assert_eq!(f("ready_to_assign"), expected, "11.7's identity doesn't hold: {m}");
+    assert!(f("assigned_in_future") >= 0, "negative assigned_in_future: {m}");
+}
+
+/// A credit account's id, transfer payee and payment category.
+#[derive(Clone, Debug)]
+pub struct Card {
+    pub id: String,
+    pub payee: String,
+    pub payment: String,
+}
+
+impl Card {
+    pub fn from(account: &Value) -> Card {
+        Card {
+            id: id_of(account),
+            payee: str_field(account, "transfer_payee_id"),
+            payment: str_field(account, "payment_category_id"),
+        }
+    }
+
+    /// The account and its transfer payee.
+    pub fn acct(&self) -> Acct {
+        Acct { id: self.id.clone(), payee: self.payee.clone() }
+    }
+}
+
+/// A plan with credit accounts: Checking, Savings and Wallet (cash), Visa (`creditCard`) and
+/// Credit Line (`lineOfCredit`), created in that order, then House and Mortgage (tracking),
+/// all with zero starting balances, and a group `Everyday` holding `Groceries` and
+/// `Household`. Its months list Visa's payment category, Credit Line's, Groceries and
+/// Household, in that order.
+pub struct CreditBudget {
+    pub plan: String,
+    /// `checking`
+    pub checking: Acct,
+    /// `savings`
+    pub savings: Acct,
+    /// `cash`
+    pub wallet: Acct,
+    /// `creditCard`, the first credit account.
+    pub visa: Acct,
+    /// Visa's payment category.
+    pub visa_payment: String,
+    /// `lineOfCredit`, the second credit account.
+    pub line: Acct,
+    /// Credit Line's payment category.
+    pub line_payment: String,
+    /// `otherAsset`
+    pub house: Acct,
+    /// `otherLiability`
+    pub mortgage: Acct,
+    pub group: String,
+    pub groceries: String,
+    pub household: String,
+}
+
+impl CreditBudget {
+    pub fn new(server: &Server) -> CreditBudget {
+        let plan = server.plan_id("Household");
+        let checking = Acct::from(&server.add_account(&plan, "Checking", "checking", 0));
+        let savings = Acct::from(&server.add_account(&plan, "Savings", "savings", 0));
+        let wallet = Acct::from(&server.add_account(&plan, "Wallet", "cash", 0));
+        let visa = Card::from(&server.add_account(&plan, "Visa", "creditCard", 0));
+        let line = Card::from(&server.add_account(&plan, "Credit Line", "lineOfCredit", 0));
+        let house = Acct::from(&server.add_account(&plan, "House", "otherAsset", 0));
+        let mortgage = Acct::from(&server.add_account(&plan, "Mortgage", "otherLiability", 0));
+        let group = id_of(&server.create_group(&plan, "Everyday"));
+        let groceries = id_of(&server.create_category(&plan, &group, "Groceries"));
+        let household = id_of(&server.create_category(&plan, &group, "Household"));
+        CreditBudget {
+            plan,
+            checking,
+            savings,
+            wallet,
+            visa_payment: visa.payment.clone(),
+            visa: visa.acct(),
+            line_payment: line.payment.clone(),
+            line: line.acct(),
+            house,
+            mortgage,
+            group,
+            groceries,
+            household,
+        }
+    }
+
+    /// Creates a transaction of `amount` in `account` on `date` with `category`; returns it.
+    pub fn txn(&self, server: &Server, account: &Acct, date: &str, amount: i64, category: &str) -> Value {
+        server.create_transaction(
+            &self.plan,
+            &json!({"account_id": account.id, "date": date, "amount": amount, "category_id": category}),
+        )
+    }
+
+    /// Creates a transfer between two on-budget accounts, entered in `from` with `to`'s
+    /// transfer payee; `amount` is `from`'s half. Returns `from`'s half.
+    pub fn transfer(&self, server: &Server, from: &Acct, to: &Acct, date: &str, amount: i64) -> Value {
+        server.create_transaction(
+            &self.plan,
+            &json!({"account_id": from.id, "date": date, "amount": amount, "payee_id": to.payee}),
+        )
+    }
+
+    /// `GET` the month.
+    pub fn month(&self, server: &Server, month: &str) -> Value {
+        server.month(&self.plan, month)
+    }
+
+    /// `GET` a category's month entry.
+    pub fn entry(&self, server: &Server, month: &str, category: &str) -> Value {
+        server.month_entry(&self.plan, month, category)
+    }
+
+    /// Sets a category's `assigned` for a month.
+    pub fn assign(&self, server: &Server, month: &str, category: &str, assigned: i64) -> Value {
+        server.assign(&self.plan, month, category, assigned)
+    }
+
+    /// Asserts that the month lists exactly `entries` (Visa's payment category, Credit
+    /// Line's, Groceries, Household), that `GET` on each entry returns the same, and that
+    /// the month satisfies 11.7's identity. Returns the month.
+    pub fn check(&self, server: &Server, month: &str, entries: [Value; 4], what: &str) -> Value {
+        let got = self.month(server, month);
+        assert_matches(&got, &json!({ "categories": entries }), &format!("{what}: {month}"));
+        assert_month_identity(&got);
+        for e in &entries {
+            let category = e["category_id"].as_str().unwrap();
+            assert_matches(&self.entry(server, month, category), e, &format!("{what}: GET {month} entry"));
+        }
+        got
+    }
+}
+
 /// `base` with `field` set to `value`, or removed if `value` is `None`.
 pub fn with(base: &Value, field: &str, value: Option<Value>) -> Value {
     let mut body = base.clone();
